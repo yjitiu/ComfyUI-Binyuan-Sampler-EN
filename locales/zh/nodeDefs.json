@@ -1,0 +1,232 @@
+{
+  "BinyuanUltimateSamplerEN": {
+    "display_name": "🛡️ Binyuan Sampler V6.5 EN｜中英双语版",
+    "description": "一体化中英双语采样器：整包 Checkpoint 或分离式（扩散模型+CLIP+VAE）加载、条件编码、采样、解码出图，并把模型/CLIP/VAE/Latent/条件作为端口输出方便串联。支持 Flux / SD3 / Wan / Qwen-Image / Krea2 / Z-Image / LTXV / Hunyuan / Lumina2 等架构。",
+    "inputs": {
+      "load_mode": {
+        "name": "加载模式",
+        "display_name": "加载模式",
+        "tooltip": "整包 Checkpoint，或分离式（扩散模型 + CLIP + VAE）。"
+      },
+      "checkpoint": {
+        "name": "Checkpoint",
+        "display_name": "Checkpoint",
+        "tooltip": "整包 .safetensors 模型（加载模式=整包 Checkpoint 时使用）。"
+      },
+      "diffusion_model": {
+        "name": "扩散模型",
+        "display_name": "扩散模型",
+        "tooltip": "扩散/UNet 权重（.safetensors 或 .gguf；.gguf 需另装 ComfyUI-GGUF）。"
+      },
+      "clip_1": {
+        "name": "CLIP 1",
+        "display_name": "CLIP 1",
+        "tooltip": "文本编码器 1（单编码器模型只填这个）。"
+      },
+      "clip_2": {
+        "name": "CLIP 2",
+        "display_name": "CLIP 2",
+        "tooltip": "双编码器模型的第二个文本编码器（如 Flux: clip_l + t5）。"
+      },
+      "clip_type": {
+        "name": "CLIP 类型",
+        "display_name": "CLIP 类型",
+        "tooltip": "必须与上面模型的架构一致。"
+      },
+      "vae": {
+        "name": "VAE",
+        "display_name": "VAE",
+        "tooltip": "baked_vae = 用模型内置 VAE；分离式模型必须外挂 VAE。"
+      },
+      "weight_precision": {
+        "name": "权重精度",
+        "display_name": "权重精度",
+        "tooltip": "default / fp8 / nvfp4 / bf16 等，需运行环境支持。"
+      },
+      "chaining_mode": {
+        "name": "串联模式",
+        "display_name": "串联模式",
+        "tooltip": "继承上游 = 使用接入的可选输入模型/CLIP/VAE。"
+      },
+      "upstream_image_handling": {
+        "name": "上游图像处理",
+        "display_name": "上游图像处理",
+        "tooltip": "上游图像送入采样前的处理方式。"
+      },
+      "latent_source": {
+        "name": "Latent 输入源",
+        "display_name": "Latent 输入源",
+        "tooltip": "空 Latent / 外部 Latent / 上游图像 / 多图横向拼接。"
+      },
+      "positive_prompt": {
+        "name": "正面提示词",
+        "display_name": "正面提示词",
+        "tooltip": "正面提示词。"
+      },
+      "negative_prompt": {
+        "name": "负面提示词",
+        "display_name": "负面提示词",
+        "tooltip": "不使用 CFG 的模型可留空。"
+      },
+      "size_preset": {
+        "name": "尺寸助手",
+        "display_name": "尺寸助手",
+        "tooltip": "选预设自动填宽高，或选自定义。"
+      },
+      "width": {
+        "name": "宽度",
+        "display_name": "宽度",
+        "tooltip": "宽度（ 8 的倍数）。"
+      },
+      "height": {
+        "name": "高度",
+        "display_name": "高度",
+        "tooltip": "高度（ 8 的倍数）。"
+      },
+      "batch_size": {
+        "name": "生成数量",
+        "display_name": "生成数量",
+        "tooltip": "一次生成几张。"
+      },
+      "seed": {
+        "name": "随机种子",
+        "display_name": "随机种子",
+        "tooltip": "随机种子。"
+      },
+      "steps": {
+        "name": "步数",
+        "display_name": "步数",
+        "tooltip": "采样步数。"
+      },
+      "cfg": {
+        "name": "CFG",
+        "display_name": "CFG",
+        "tooltip": "CFG 引导强度。"
+      },
+      "flux_guidance": {
+        "name": "Flux 引导",
+        "display_name": "Flux 引导",
+        "tooltip": "Flux / flux2 / pixeldit 等架构的内嵌 guidance。"
+      },
+      "sampler": {
+        "name": "采样算法",
+        "display_name": "采样算法",
+        "tooltip": "采样算法。"
+      },
+      "scheduler": {
+        "name": "调度器",
+        "display_name": "调度器",
+        "tooltip": "噪声调度器。"
+      },
+      "denoise": {
+        "name": "重绘强度",
+        "display_name": "重绘强度",
+        "tooltip": "1.0 = 文生图，越低越偏图生图。"
+      },
+      "lora_json": {
+        "name": "LoRA JSON",
+        "display_name": "LoRA JSON",
+        "tooltip": "LoRA 的 JSON 列表（上方界面自动写入，也可手填）。"
+      },
+      "lora_list": {
+        "name": "LoRA 列表",
+        "display_name": "LoRA 列表",
+        "tooltip": "选择一个 LoRA（供上方 LoRA 管理器使用）。"
+      },
+      "cleanup_vram": {
+        "name": "生成后清理显存",
+        "display_name": "生成后清理显存",
+        "tooltip": "生成后释放显存并回收内存。"
+      },
+      "external_model": {
+        "name": "外部模型",
+        "display_name": "外部模型",
+        "tooltip": "MODEL 输入，供串联模式使用。"
+      },
+      "external_clip": {
+        "name": "外部 CLIP",
+        "display_name": "外部 CLIP",
+        "tooltip": "CLIP 输入。"
+      },
+      "external_vae": {
+        "name": "外部 VAE",
+        "display_name": "外部 VAE",
+        "tooltip": "VAE 输入。"
+      },
+      "external_latent": {
+        "name": "外部 Latent",
+        "display_name": "外部 Latent",
+        "tooltip": "LATENT 输入。"
+      },
+      "external_sigmas": {
+        "name": "外部 Sigmas",
+        "display_name": "外部 Sigmas",
+        "tooltip": "SIGMAS 输入，接管步数与调度器。"
+      },
+      "external_positive": {
+        "name": "外部正面条件",
+        "display_name": "外部正面条件",
+        "tooltip": "正向 CONDITIONING 输入。"
+      },
+      "external_negative": {
+        "name": "外部负面条件",
+        "display_name": "外部负面条件",
+        "tooltip": "负向 CONDITIONING 输入。"
+      },
+      "lora_settings": {
+        "name": "LoRA 设置",
+        "display_name": "LoRA 设置",
+        "tooltip": "可选，接 Binyuan LoRA设置 节点的输出。"
+      },
+      "upstream_image_1": {
+        "name": "上游图像 1",
+        "display_name": "上游图像 1",
+        "tooltip": "IMAGE 输入。"
+      },
+      "upstream_image_2": {
+        "name": "上游图像 2",
+        "display_name": "上游图像 2",
+        "tooltip": "IMAGE 输入。"
+      },
+      "upstream_image_3": {
+        "name": "上游图像 3",
+        "display_name": "上游图像 3",
+        "tooltip": "IMAGE 输入。"
+      }
+    },
+    "outputs": {
+      "image": {
+        "name": "图像",
+        "display_name": "图像"
+      },
+      "model": {
+        "name": "模型",
+        "display_name": "模型"
+      },
+      "clip": {
+        "name": "CLIP",
+        "display_name": "CLIP"
+      },
+      "vae": {
+        "name": "VAE",
+        "display_name": "VAE"
+      },
+      "latent": {
+        "name": "Latent",
+        "display_name": "Latent"
+      },
+      "positive": {
+        "name": "正面条件",
+        "display_name": "正面条件"
+      },
+      "negative": {
+        "name": "负面条件",
+        "display_name": "负面条件"
+      },
+      "denoised_latent": {
+        "name": "降噪Latent",
+        "display_name": "降噪Latent"
+      }
+    }
+  }
+}

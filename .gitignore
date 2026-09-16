@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+
+# 本地备份与打包产物（不参与发布）
+*.bak
+*.bak-*
+*.bak_*
+*.rar
+node.zip
