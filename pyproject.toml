@@ -1,7 +1,7 @@
 [project]
 name = "binyuan-sampler-english"
 description = "ComfyUI custom node - bilingual (English/Chinese) all-in-one Ultimate Sampler V2.2 EN. Whole checkpoint or split stack (diffusion + dual CLIP + VAE), Flux/SD3/Wan/Qwen-Image/Krea2/Z-Image/LTXV support, LoRA list, fp8/nvfp4 weight precision. Same node also available as the Chinese-only edition."
-version = "2.2.1"
+version = "2.2.2"
 requires-python = ">= 3.10"
 dependencies = []
 license = "MIT"
