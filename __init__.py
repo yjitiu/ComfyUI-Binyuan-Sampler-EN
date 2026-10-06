@@ -1,9 +1,9 @@
-# 🛡️ Binyuan Sampler V6.5 EN - bilingual (English / 中文) build
-# Generated from binyuan_sampler_plugin_v6.0 (V6.5). The sampling logic is identical;
-# only widget keys/labels, option values, tooltips and messages were made bilingual.
+# 🛡️ Binyuan Sampler V2.2 EN - bilingual (English / 中文) build
+# Includes native Qwen-Image-2.1 conditioning and reference-image support.
 # This node uses its own key (BinyuanUltimateSamplerEN) so it can live next to the Chinese version.
 import os
 import re
+import random
 import sys
 import gc
 import json
@@ -17,6 +17,8 @@ import comfy.utils
 import comfy.sd
 import comfy.sample
 import comfy.samplers
+import comfy.latent_formats
+import comfy.ldm.modules.attention
 import latent_preview
 import torch.nn.functional as F
 from PIL import Image
@@ -51,12 +53,85 @@ CLIP_TYPE_CANONICAL = {
     "lens": "lens", "longcat_image": "longcat_image", "ltxv": "ltxv",
     "lumina2": "lumina2", "mochi": "mochi", "omnigen2": "omnigen2", "ovis": "ovis",
     "pid": "pixeldit", "pixart": "pixart", "pixeldit": "pixeldit", "pixl": "pixeldit",
-    "qwen_image": "qwen_image", "sd3": "sd3", "stable_audio": "stable_audio",
+    "qwen_image": "qwen_image", "qwen_image_2.1": "qwen_image", "sd3": "sd3", "stable_audio": "stable_audio",
     "stable_cascade": "stable_cascade", "stable_diffusion": "stable_diffusion", "wan": "wan",
 }
 
 # 需要附加 Flux 风格 guidance 的类型
 GUIDANCE_CLIP_TYPES = {"flux", "flux2", "pid", "pixl", "boogu", "ideogram4", "pixeldit"}
+
+# ============================ 动态提示词 {a|b|c} 抽签 ============================
+# 前端（网页界面）的抽签只在"提交队列"时执行，而且只作用于**直接写在 widget 里**的
+# 文本：连线传进来的字符串、以及用 API / 外部程序提交的请求都不会被展开，括号和竖线
+# 会原样送进文本编码器，模型就会把所有选项一起画出来（典型症状：一张图好几个人）。
+# 这里补一层服务端抽签，两种来源都能生效。
+def binyuan_expand_dynamic_prompt(text, seed=0, label="正面"):
+    """展开 {a|b|c}，行为与 ComfyUI 前端 processDynamicPrompt 对齐。
+
+    - { } 必须成对；不配对时**不抽签**并给出警告（避免把 JSON 之类的文本吃掉）
+    - 选项之间只能用半角竖线 |，支持嵌套
+    - 每次运行重新随机（与网页端抽签一致），不看 seed
+    """
+    if not isinstance(text, str) or "{" not in text:
+        return text
+    if text.count("{") != text.count("}"):
+        print("[binyuan] %s提示词花括号不配对（{ %d 个 / } %d 个），已跳过抽签，原文送进模型。"
+              % (label, text.count("{"), text.count("}")))
+        return text
+
+    s = re.sub(r"/\*[\s\S]*?\*/|//.*", "", text)   # 与前端一致：/* */ 和 // 会被当注释删掉
+    # 每次运行重新随机抽签（与 ComfyUI 前端行为一致）。
+    # 注意：这里**不绑定 seed** —— 否则 seed 固定的工作流每次都抽到同一个选项，
+    # 表面上就像"抽签没生效/没变化"。
+    rng = random.Random()
+
+    def walk(txt):
+        out, i = "", 0
+        while i < len(txt):
+            c = txt[i]
+            i += 1
+            if c == "\\":
+                if i < len(txt):
+                    out += "\\" + txt[i]
+                    i += 1
+                else:
+                    out += "\\"
+                continue
+            if c != "{":
+                out += c
+                continue
+            opts, cur, depth = [], "", 0
+            while i < len(txt):
+                a = txt[i]
+                i += 1
+                if a == "\\":
+                    if i < len(txt):
+                        cur += "\\" + txt[i]
+                        i += 1
+                    else:
+                        cur += "\\"
+                    continue
+                if a == "{":
+                    depth += 1
+                elif a == "}":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif a == "|" and depth == 0:
+                    opts.append(cur)
+                    cur = ""
+                    continue
+                cur += a
+            opts.append(cur)
+            out += walk(opts[rng.randrange(len(opts))])
+        return out
+
+    result = re.sub(r"\\([{}|])", r"\1", walk(s))
+    if result != text:
+        print("[binyuan] %s提示词抽签: %s%s"
+              % (label, result[:110], "..." if len(result) > 110 else ""))
+    return result
+# ===============================================================================
 
 def normalize_clip_type(clip_type):
     """把用户选择的 CLIP_类型 归一化为 ComfyUI 可识别的 CLIPType 名称。"""
@@ -135,11 +210,22 @@ def load_gguf_clip(clip_paths, clip_type_str):
     clip_data = inst.load_data(paths)
     return inst.load_patcher(paths, clip_type, clip_data)
 
+class ReferenceImageInputs(dict):
+    # Keep the legacy node schema/port IDs while accepting dynamically added ports.
+    def __contains__(self, key):
+        return super().__contains__(key) or bool(re.fullmatch(r"upstream_image_[1-9][0-9]*", key))
+
+    def __getitem__(self, key):
+        if re.fullmatch(r"upstream_image_[1-9][0-9]*", key):
+            return ("IMAGE",)
+        return super().__getitem__(key)
+
+
 class BinyuanUltimateSamplerEN:
     # ===== Bilingual (EN/ZH) compatibility layer =====
     # Widget labels are English; combo values are written as "English ｜ 中文".
     # This table maps them back to the internal canonical keys/values, so all the
-    # sampling logic below is identical to the Chinese V6.5 plugin.
+    # sampling logic below consumes canonical keys for both UI languages.
     EN_KEY_MAP = {
         "load_mode": "加载模式",
         "checkpoint": "Checkpoint",
@@ -178,7 +264,10 @@ class BinyuanUltimateSamplerEN:
         "lora_settings": "LoRA设置",
         "upstream_image_1": "上游图像_1",
         "upstream_image_2": "上游图像_2",
-        "upstream_image_3": "上游图像_3"
+        "upstream_image_3": "上游图像_3",
+        "qwen_reference_resolution": "Qwen参考分辨率",
+        "qwen_edit_mode": "Qwen编辑模式",
+        "attention_backend": "注意力后端"
     }
 
     EN_VALUE_MAP = {
@@ -204,6 +293,17 @@ class BinyuanUltimateSamplerEN:
         },
         "尺寸助手": {
             "Custom ｜ 自定义": "自定义"
+        },
+        "Qwen编辑模式": {
+            "Auto ｜ 自动": "自动",
+            "Native reference edit ｜ 原生参考编辑": "原生参考编辑",
+            "VAE redraw ｜ VAE传统重绘": "VAE传统重绘"
+        },
+        "注意力后端": {
+            "Auto safe ｜ 自动稳定": "自动稳定",
+            "Core default ｜ 内核默认": "内核默认",
+            "Comfy Kitchen ｜ Comfy Kitchen": "Comfy Kitchen",
+            "Sub-quadratic ｜ 分块省显存": "分块省显存"
         }
     }
 
@@ -278,6 +378,8 @@ class BinyuanUltimateSamplerEN:
         out = {}
         for k, v in kwargs.items():
             key = cls.EN_KEY_MAP.get(k, k)
+            if re.fullmatch(r"upstream_image_[1-9][0-9]*", k):
+                key = "上游图像_" + k.rsplit("_", 1)[1]
             if isinstance(v, str):
                 vmap = cls.EN_VALUE_MAP.get(key)
                 if vmap:
@@ -313,7 +415,7 @@ class BinyuanUltimateSamplerEN:
             "ACE", "boogu", "chroma", "cogvideox", "cosmos", "flux", "flux2",
             "hidream", "hunyuan_image", "ideogram4", "krea2", "lens", "longcat_image",
             "LTXV", "lumina2", "mochi", "omnigen2", "ovis", "pid", "PixArt",
-            "pixeldit", "pixl", "qwen_image", "sd3", "SD3", "stable_audio",
+            "pixeldit", "pixl", "qwen_image", "qwen_image_2.1", "sd3", "SD3", "stable_audio",
             "stable_cascade", "stable_diffusion", "wan"
         ]
 
@@ -335,8 +437,10 @@ class BinyuanUltimateSamplerEN:
                 "chaining_mode": (["Own model ｜ 使用自身模型", "Inherit upstream ｜ 继承上游模型", "Auto detect ｜ 自动检测"], {"default": "Inherit upstream ｜ 继承上游模型"}),
                 "upstream_image_handling": (["Re-encode with VAE ｜ 重新VAE编码", "Use directly as latent ｜ 直接作为Latent", "Auto ｜ 自动选择"], {"default": "Re-encode with VAE ｜ 重新VAE编码"}),
                 "latent_source": (["Empty latent ｜ 空Latent", "External latent first ｜ 外部Latent优先", "Upstream image first ｜ 上游图像优先", "Stitch upstream images ｜ 上游图像拼接"], {"default": "Upstream image first ｜ 上游图像优先"}),
-                "positive_prompt": ("STRING", {"multiline": True, "default": "masterpiece, best quality, 1girl"}),
-                "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "positive_prompt": ("STRING", {"multiline": True, "dynamicPrompts": True, "default": "masterpiece, best quality, 1girl",
+                    "tooltip": "支持 {a|b|c} 动态提示词抽签：每次点 Run 重新随机抽一个。网页点 Run 由前端抽签；连线传入或 API/外部调用由节点在服务端抽签。{ } 必须成对，选项之间用半角竖线 | 。"}),
+                "negative_prompt": ("STRING", {"multiline": True, "dynamicPrompts": True, "default": "",
+                    "tooltip": "同上，负向提示词同样支持 {a|b|c} 抽签。"}),
                 "size_preset": (PRESET_SIZES, {"default": "Custom ｜ 自定义"}),
                 "width": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 8}),
                 "height": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 8}),
@@ -352,7 +456,7 @@ class BinyuanUltimateSamplerEN:
                 "lora_list": (["None"] + get_files("loras") + get_files("lora"),),
                 "cleanup_vram": ("BOOLEAN", {"default": False, "label": "Clear VRAM after run / 生成后清理显存"}),
             },
-            "optional": {
+            "optional": ReferenceImageInputs({
                 "external_model": ("MODEL",),
                 "external_clip": ("CLIP",),
                 "external_vae": ("VAE",),
@@ -364,14 +468,31 @@ class BinyuanUltimateSamplerEN:
                 "upstream_image_1": ("IMAGE",),
                 "upstream_image_2": ("IMAGE",),
                 "upstream_image_3": ("IMAGE",),
-            }
+                "qwen_reference_resolution": ("INT", {"default": 1024, "min": 0, "max": 4096, "step": 32,
+                    "tooltip": "Qwen-Image-2.1 reference pixel budget (resolution squared); 0 keeps original size, aligned to 32. Editing output follows the first reference. / Qwen-Image-2.1 参考图像素预算（分辨率平方）；0 保持原尺寸并对齐32，编辑输出尺寸跟随第一张参考图。"}),
+                "qwen_edit_mode": (["Auto ｜ 自动", "Native reference edit ｜ 原生参考编辑", "VAE redraw ｜ VAE传统重绘"], {
+                    "default": "Auto ｜ 自动",
+                    "tooltip": "Auto keeps existing workflows compatible. Native reference edit uses Qwen-Image-2.1 official reference conditioning and an empty latent (denoise is fixed to 1). VAE redraw encodes the upstream image as the initial latent, preserves its canvas (32-pixel alignment), and enables adjustable denoise. / 自动模式兼容旧工作流；原生参考编辑使用官方参考条件与空Latent（重绘强度固定为1）；VAE传统重绘把上游图像编码为初始Latent，保持画布（对齐32）并允许调节重绘强度。"
+                }),
+                "attention_backend": (["Auto safe ｜ 自动稳定", "Core default ｜ 内核默认", "Comfy Kitchen ｜ Comfy Kitchen", "Sub-quadratic ｜ 分块省显存"], {
+                    "default": "Auto safe ｜ 自动稳定",
+                    "tooltip": "Auto safe uses Comfy Kitchen for internally loaded Krea2/Qwen-Image-2.1 models when available, otherwise ComfyUI's sub-quadratic backend; other models and externally patched models retain their backend. Core default follows ComfyUI startup flags. / 自动稳定为内部加载的Krea2/Qwen-Image-2.1模型选用可用的Comfy Kitchen，否则使用内核分块后端；其他模型与已外接修补的模型保持原后端。内核默认遵循启动参数。"
+                }),
+                "advanced_sampling": ("BOOLEAN", {"default": False, "tooltip": "Advanced step range; steps becomes total schedule steps, denoise is ignored. / 高级分段：步数为总步数，忽略重绘强度。"}),
+                "start_at_step": ("INT", {"default": 0, "min": 0, "max": 10000, "tooltip": "Zero-based start; 10 starts after the first 10 steps. / 从0计数；10表示跳过前10步。"}),
+                "end_at_step": ("INT", {"default": 10000, "min": 0, "max": 10000, "tooltip": "Stop boundary, clamped to total steps. / 结束边界；超过总步数即运行到最后。"}),
+                "add_noise": ("BOOLEAN", {"default": True, "tooltip": "Disable when continuing an upstream noisy LATENT. / 接续上游带噪LATENT时关闭；成图重绘时开启。"}),
+                "return_with_leftover_noise": ("BOOLEAN", {"default": False, "tooltip": "Enable for the first segment; pass LATENT, not denoised_latent, to the next sampler. / 第一段开启，把LATENT传给下一段，不要传去噪Latent。"}),
+                "noise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "Initial random-noise multiplier in both modes: 1=normal, 0=no added initial noise. Advanced Add noise OFF overrides this. Does not change sigma schedule or remove existing noise. / 两种模式均有效：1为标准新增噪声，0不新增初始噪声；高级模式关闭添加噪声时本项无效。不改变采样日程，不消除输入已有噪声。"}),
+            })
         }
 
     RETURN_TYPES = ("IMAGE", "MODEL", "CLIP", "VAE", "LATENT", "CONDITIONING", "CONDITIONING", "LATENT")
     RETURN_NAMES = ("IMAGE / 图像", "MODEL / 模型", "CLIP", "VAE", "LATENT / Latent", "POSITIVE / 正面条件", "NEGATIVE / 负面条件", "DENOISED / 降噪Latent")
     FUNCTION = "run"
     CATEGORY = "Binyuan"
-    DESCRIPTION = "All-in-one bilingual sampler: loads a whole checkpoint or a split stack (diffusion model + dual CLIP + VAE), encodes prompts, samples and decodes - and also outputs model/CLIP/VAE/latent/conditioning for chaining. Supports Flux / SD3 / Wan / Qwen-Image / Krea2 / Z-Image / LTXV / Hunyuan / Lumina2 ... English + Chinese UI. ｜ 一体化中英双语采样器：整包 Checkpoint 或分离式（扩散模型+CLIP+VAE）加载、条件编码、采样、解码出图，并把模型/CLIP/VAE/Latent/条件作为端口输出方便串联。支持 Flux / SD3 / Wan / Qwen-Image / Krea2 / Z-Image / LTXV / Hunyuan / Lumina2 等架构。"
+    DESCRIPTION = "All-in-one bilingual sampler: loads a whole checkpoint or a split stack (diffusion model + dual CLIP + VAE), encodes prompts, samples and decodes - and also outputs model/CLIP/VAE/latent/conditioning for chaining. Supports Flux / SD3 / Wan / Qwen-Image / Qwen-Image-2.1 / Krea2 / Z-Image / LTXV / Hunyuan / Lumina2 ... English + Chinese UI. ｜ 一体化中英双语采样器：整包 Checkpoint 或分离式（扩散模型+CLIP+VAE）加载、条件编码、采样、解码出图，并把模型/CLIP/VAE/Latent/条件作为端口输出方便串联。支持 Flux / SD3 / Wan / Qwen-Image / Qwen-Image-2.1 / Krea2 / Z-Image / LTXV / Hunyuan / Lumina2 等架构。"
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
@@ -429,6 +550,50 @@ class BinyuanUltimateSamplerEN:
             return model.get_model_object("latent_format")
         except Exception:
             return None
+
+    def configure_attention_backend(self, model, selection, internally_loaded):
+        """Select a model-local attention implementation without changing global flags."""
+        attention = comfy.ldm.modules.attention
+        if selection == "自动稳定":
+            if not internally_loaded:
+                return model  # Preserve upstream ModelAttentionBackend patches.
+            model_class = type(getattr(model, "model", None)).__name__
+            if model_class not in ("Krea2", "QwenImage21"):
+                return model
+            available = bool(getattr(attention, "COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE", False))
+            backend_name = "comfy_kitchen_int8" if available else "sub_quad"
+        elif selection == "内核默认":
+            return model
+        elif selection == "Comfy Kitchen":
+            backend_name = "comfy_kitchen_int8"
+        elif selection == "分块省显存":
+            backend_name = "sub_quad"
+        else:
+            return model
+
+        getter = getattr(attention, "get_attention_function", None)
+        backend_function = getter(backend_name, None) if callable(getter) else None
+        if backend_function is None:
+            backend_function = getattr(attention, {
+                "comfy_kitchen_int8": "attention_comfy_kitchen_int8",
+                "sub_quad": "attention_sub_quad",
+            }[backend_name], None)
+        if backend_name == "comfy_kitchen_int8" and not getattr(
+            attention, "COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE", False
+        ):
+            backend_function = None
+        if backend_function is None or not hasattr(model, "set_model_optimized_attention"):
+            if selection != "自动稳定":
+                raise RuntimeError(
+                    f"Attention backend {selection} is unavailable in this ComfyUI installation. "
+                    f"/ 当前ComfyUI环境不支持注意力后端：{selection}。"
+                )
+            print(f"[WARN] safe attention backend {backend_name} unavailable; using ComfyUI default")
+            return model
+        patched = model.clone()
+        patched.set_model_optimized_attention(backend_function)
+        print(f"[INFO] model-local attention backend: {backend_name} (model={type(model.model).__name__})")
+        return patched
 
     def empty_latent_for_model(self, model, width, height, batch):
         """按模型 latent 格式创建空 Latent（通道数与下采样比与模型匹配）。"""
@@ -629,7 +794,7 @@ class BinyuanUltimateSamplerEN:
         return model, clip, loaded_count
 
     def run(self, **kwargs):
-        print("[INFO] Binyuan Sampler V6.5 EN (bilingual)")
+        print("[INFO] Binyuan Sampler V2.2 EN (bilingual)")
         # ---- English UI -> internal canonical keys/values ----
         kwargs = self._translate_kwargs(kwargs)
         
@@ -652,12 +817,25 @@ class BinyuanUltimateSamplerEN:
         高度 = int(kwargs.get("高度", 1024))
         生成数量 = int(kwargs.get("生成数量", 1))
         seed = int(kwargs.get("seed", 0))
+        # ---- 动态提示词 {a|b|c} 服务端抽签：连线传入的文本、API/外部调用都能生效 ----
+        正面提示词 = binyuan_expand_dynamic_prompt(正面提示词, seed, "正面")
+        负面提示词 = binyuan_expand_dynamic_prompt(负面提示词, seed, "负面")
         步数 = int(kwargs.get("步数", 20))
         CFG = float(kwargs.get("CFG", 1.0))
         Flux引导 = float(kwargs.get("Flux引导", 3.5))
         采样算法 = kwargs.get("采样算法", "euler")
         调度器 = kwargs.get("调度器", "simple")
         重绘强度 = float(kwargs.get("重绘强度", 1.0))
+        advanced_sampling = bool(kwargs.get("advanced_sampling", False))
+        start_at_step = max(0, int(kwargs.get("start_at_step", 0)))
+        end_at_step = max(0, int(kwargs.get("end_at_step", 10000)))
+        add_noise = bool(kwargs.get("add_noise", True))
+        noise_strength = float(kwargs.get("noise_strength", 1.0))
+        if not 0.0 <= noise_strength <= 2.0:
+            raise ValueError("Noise strength must be between 0 and 2 / 初始噪声强度须在0到2之间")
+        return_with_leftover_noise = bool(kwargs.get("return_with_leftover_noise", False))
+        Qwen编辑模式 = kwargs.get("Qwen编辑模式", "自动")
+        注意力后端 = kwargs.get("注意力后端", "自动稳定")
         lora_json_str = kwargs.get("lora_json", "[]")
         lora_settings = kwargs.get("LoRA设置") or []
         自动清理显存 = kwargs.get("自动清理显存", False)
@@ -671,17 +849,11 @@ class BinyuanUltimateSamplerEN:
         external_positive = kwargs.get("外部正面条件")
         external_negative = kwargs.get("外部负面条件")
         
-        upstream_image_1 = kwargs.get("上游图像_1")
-        upstream_image_2 = kwargs.get("上游图像_2")
-        upstream_image_3 = kwargs.get("上游图像_3")
-
-        upstream_images = []
-        if upstream_image_1 is not None:
-            upstream_images.append(upstream_image_1)
-        if upstream_image_2 is not None:
-            upstream_images.append(upstream_image_2)
-        if upstream_image_3 is not None:
-            upstream_images.append(upstream_image_3)
+        image_keys = sorted(
+            (key for key in kwargs if re.fullmatch(r"上游图像_[1-9][0-9]*", key)),
+            key=lambda key: int(key.rsplit("_", 1)[1]),
+        )
+        upstream_images = [kwargs[key] for key in image_keys if kwargs[key] is not None]
         
         print(f"[INFO] upstream images: {len(upstream_images)}")
         print(f"[INFO] chaining mode: {串联模式}")
@@ -822,11 +994,15 @@ class BinyuanUltimateSamplerEN:
                 else:
                     raise RuntimeError(
                         "VAE is not loaded. Whole-file checkpoints usually contain a VAE; separate diffusion models do not. "
-                        "Pick the matching VAE file in the VAE dropdown (e.g. ae.safetensors for Flux/SD3, the wan2.1 VAE for Wan/Qwen/Krea2). "
+                        "Pick the matching VAE file in the VAE dropdown (e.g. ae.safetensors for Flux/SD3, the matching Wan VAE for Wan/older Qwen, the 64-channel RGBA VAE for Qwen-Image-2.1). "
                         "/ 未加载 VAE。整包 Checkpoint 通常自带 VAE；分离式模型不会自带 VAE，必须在 VAE 下拉框选择对应的 VAE 文件。"
                     )
             # 校验 VAE 与模型 latent 通道匹配，避免「能采样但解码失败」
             self.validate_vae(model, vae)
+            model = self.configure_attention_backend(
+                model, 注意力后端, internally_loaded=not (use_inherit and external_model is not None)
+            )
+            is_qwen21 = isinstance(self.get_latent_format(model), getattr(comfy.latent_formats, "QwenImage21", ()))
             
             # ========== LoRA 加载（多 LoRA 叠加，跨内核稳定） ==========
             lora_list = self.parse_lora_config(lora_json_str)
@@ -865,31 +1041,111 @@ class BinyuanUltimateSamplerEN:
                     cond_dict["guidance"] = guidance_val
                 return [[cond, cond_dict]]
 
+            qwen_positive = qwen_negative = qwen_empty_latent = None
+            qwen_has_references = bool(upstream_images)
+            if Qwen编辑模式 == "自动":
+                qwen_runtime_mode = "原生参考编辑" if qwen_has_references else "文生图"
+            else:
+                qwen_runtime_mode = Qwen编辑模式
+            if is_qwen21 and qwen_runtime_mode == "VAE传统重绘" and not qwen_has_references and external_latent is None:
+                raise RuntimeError(
+                    "Qwen VAE redraw requires an upstream image or external latent. "
+                    "/ Qwen VAE传统重绘需要连接上游图像或外部Latent。"
+                )
+            if is_qwen21 and not has_complete_external_conditioning:
+                encoder = nodes.NODE_CLASS_MAPPINGS.get("TextEncodeQwenImage21")
+                if encoder is None:
+                    raise RuntimeError("TextEncodeQwenImage21 is unavailable; update ComfyUI. / 缺少 Qwen-Image-2.1 原生编码节点，请更新 ComfyUI。")
+                references = upstream_images
+                if Latent输入源 == "上游图像拼接" and references:
+                    _, target_h = self.get_image_size(references[0])
+                    references = [self.stitch_images_horizontal(references, target_h)]
+                # VAE redraw deliberately keeps the source canvas. Native reference
+                # mode follows the official Qwen resolution control.
+                reference_resolution = 0 if qwen_runtime_mode == "VAE传统重绘" else int(kwargs.get("Qwen参考分辨率", 1024))
+                encoded = encoder.execute(
+                    clip, 正面提示词, 负面提示词, vae=vae,
+                    resolution=reference_resolution,
+                    images={f"image_{i}": image for i, image in enumerate(references, 1)},
+                )
+                qwen_positive, qwen_negative, qwen_empty_latent = encoded[0], encoded[1], encoded[2]
+
             if use_inherit and external_positive is not None:
                 positive = external_positive
                 print("[INFO] using external positive conditioning")
+            elif is_qwen21:
+                positive = qwen_positive
             else:
                 positive = encode_prompt(正面提示词, CLIP_类型_规范, Flux引导)
 
             if use_inherit and external_negative is not None:
                 negative = external_negative
                 print("[INFO] using external negative conditioning")
+            elif is_qwen21:
+                negative = qwen_negative
             elif 负面提示词 and 负面提示词.strip():
                 negative = encode_prompt(负面提示词, CLIP_类型_规范, Flux引导)
             else:
                 # 空负面也要走 return_dict，保证 attention_mask/num_tokens 与正面一致
                 negative = encode_prompt(" ", CLIP_类型_规范, Flux引导)
             
-            # ========== Latent ==========
+            # ========== Latent ========== 
             latent = None
+            latent_origin = "unknown"
             if use_inherit and external_latent is not None:
                 latent = external_latent
+                latent_origin = "external"
                 print("[INFO] using external latent")
             elif Latent输入源 == "外部Latent优先" and external_latent is not None:
                 latent = external_latent
+                latent_origin = "external"
                 print("[INFO] using external latent (preferred)")
+            elif is_qwen21 and qwen_runtime_mode == "VAE传统重绘" and upstream_images:
+                # TextEncodeQwenImage21 already VAE-encodes the references. Reuse the
+                # first official reference latent as the noisy starting image instead
+                # of encoding it a second time. This is real img2img/redraw behavior.
+                refs = positive[0][1].get("reference_latents", []) if positive else []
+                if not refs:
+                    w, h = self.get_image_size(upstream_images[0])
+                    fallback_latent = self.encode_image_to_latent(vae, upstream_images[0], w, h)
+                    if fallback_latent is None:
+                        raise RuntimeError(
+                            "Qwen VAE redraw could not encode the upstream image. Check the matching Qwen VAE. "
+                            "/ Qwen VAE传统重绘无法编码上游图像，请检查是否使用匹配的Qwen VAE。"
+                        )
+                    redraw_samples = fallback_latent["samples"]
+                else:
+                    redraw_samples = refs[0]
+                if redraw_samples.shape[0] == 1 and 生成数量 > 1:
+                    redraw_samples = redraw_samples.repeat(生成数量, *([1] * (redraw_samples.dim() - 1)))
+                latent = {"samples": redraw_samples}
+                latent_origin = "qwen21_vae_redraw"
+                高度, 宽度 = redraw_samples.shape[-2] * 16, redraw_samples.shape[-1] * 16
+                print(f"[INFO] Qwen-Image-2.1 VAE redraw: {宽度}x{高度}; denoise is adjustable")
+            elif is_qwen21:
+                refs = positive[0][1].get("reference_latents", []) if positive else []
+                if refs:
+                    # Native reference editing must use the empty latent returned by
+                    # the official encoder so its canvas matches the resized reference.
+                    latent = qwen_empty_latent
+                    if latent is None:
+                        latent = self.empty_latent_for_model(model, 宽度, 高度, 生成数量)
+                    latent_origin = "qwen21_reference_empty"
+                    print("[INFO] Qwen-Image-2.1 native reference editing uses the reference canvas")
+                else:
+                    # Text-to-image has no reference canvas. The encoder's `resolution`
+                    # fallback is always square, so it must not override the sampler's
+                    # user-selected width and height.
+                    latent = self.empty_latent_for_model(model, 宽度, 高度, 生成数量)
+                    latent_origin = "empty"
+                    print(f"[INFO] Qwen-Image-2.1 text-to-image uses custom canvas: {宽度}x{高度}")
+                if latent["samples"].shape[0] == 1 and 生成数量 > 1:
+                    latent = latent.copy()
+                    samples = latent["samples"]
+                    latent["samples"] = samples.repeat(生成数量, *([1] * (samples.dim() - 1)))
             elif Latent输入源 == "空Latent":
                 latent = self.empty_latent_for_model(model, 宽度, 高度, 生成数量)
+                latent_origin = "empty"
                 print(f"[INFO] using empty latent: {宽度}x{高度}")
             elif Latent输入源 == "上游图像拼接" and len(upstream_images) >= 1:
                 # 将多张上游图像横向拼接为一张画布后编码为 Latent
@@ -900,22 +1156,31 @@ class BinyuanUltimateSamplerEN:
                     sh, sw = stitched.shape[1], stitched.shape[2]
                     print(f"[INFO] 拼接上游图像: {len(upstream_images)} 张 → 画布 {sw}x{sh}")
                     latent = self.encode_image_to_latent(vae, stitched, sw, sh)
+                    if latent is not None:
+                        latent_origin = "vae_image"
                 if latent is None:
                     w, h = self.get_image_size(upstream_images[0])
                     latent = self.encode_image_to_latent(vae, upstream_images[0], w, h)
+                    if latent is not None:
+                        latent_origin = "vae_image"
                 if latent is None:
                     latent = self.empty_latent_for_model(model, 宽度, 高度, 生成数量)
+                    latent_origin = "empty"
                     print(f"[INFO] 拼接编码失败，使用空Latent")
             elif len(upstream_images) >= 1:
                 # 上游图像优先 / 自动选择
                 w, h = self.get_image_size(upstream_images[0])
                 print(f"[INFO] 编码上游图像: {w}x{h}")
                 latent = self.encode_image_to_latent(vae, upstream_images[0], w, h)
+                if latent is not None:
+                    latent_origin = "vae_image"
                 if latent is None:
                     latent = self.empty_latent_for_model(model, 宽度, 高度, 生成数量)
+                    latent_origin = "empty"
                     print(f"[INFO] 编码失败，使用空Latent")
             else:
                 latent = self.empty_latent_for_model(model, 宽度, 高度, 生成数量)
+                latent_origin = "empty"
                 print(f"[INFO] using empty latent: {宽度}x{高度}")
             
             if latent is None:
@@ -934,30 +1199,64 @@ class BinyuanUltimateSamplerEN:
             if external_sigmas is not None:
                 sigmas = external_sigmas
                 print(f"[INFO] 使用外部Sigmas，采样步数: {max(int(sigmas.shape[-1]) - 1, 0)}")
+            elif advanced_sampling:
+                sigmas = comfy.samplers.KSampler(
+                    model, 步数, "cpu", sampler=采样算法, scheduler=调度器, denoise=1.0
+                ).sigmas
             else:
-                if 重绘强度 <= 0.0:
+                effective_denoise = 1.0 if advanced_sampling else 重绘强度
+                if latent_origin in ("empty", "qwen21_reference_empty") and effective_denoise < 1.0:
+                    print(
+                        f"[WARN] denoise={effective_denoise} cannot be used with an empty initial latent; "
+                        "using 1.0 to prevent corrupted output. Connect external_latent for second-pass sampling. "
+                        f"/ 当前为{('Qwen-Image-2.1原生参考编辑' if latent_origin == 'qwen21_reference_empty' else '空Latent文生图')}，"
+                        "重绘强度已自动改为1.0；二次采样请连接外部Latent。"
+                    )
+                    effective_denoise = 1.0
+                elif latent_origin in ("external", "vae_image", "qwen21_vae_redraw"):
+                    print(f"[INFO] latent redraw mode ({latent_origin}); denoise={effective_denoise} is enabled")
+
+                if effective_denoise <= 0.0:
                     sigmas = torch.FloatTensor([])
                 else:
-                    total_steps = 步数 if 重绘强度 >= 1.0 else int(步数 / 重绘强度)
+                    total_steps = 步数 if effective_denoise >= 1.0 else int(步数 / effective_denoise)
                     sigmas = comfy.samplers.calculate_sigmas(
                         model.get_model_object("model_sampling"), 调度器, total_steps
                     ).cpu()
                     sigmas = sigmas[-(步数 + 1):]
-                print(f"[INFO] 使用内部Sigmas: {调度器}, {步数}步, 重绘强度={重绘强度}")
+                print(f"[INFO] 使用内部Sigmas: {调度器}, {步数}步, 请求重绘强度={重绘强度}, 实际重绘强度={effective_denoise}")
+
+            if advanced_sampling:
+                schedule_steps = max(len(sigmas) - 1, 0)
+                stop = min(end_at_step, schedule_steps)
+                # Match KSamplerAdvanced: truncate the end, then slice the start.
+                sigmas = sigmas[:stop + 1].clone()
+                if stop < schedule_steps and not return_with_leftover_noise and len(sigmas):
+                    sigmas[-1] = 0
+                sigmas = sigmas[start_at_step:]
+                print(f"[INFO] Advanced sampling / 高级分段：总步数={schedule_steps}, 起始={start_at_step}, 结束={stop}, 实际步数={max(len(sigmas)-1, 0)}, 添加噪声={add_noise}, 保留剩余噪声={return_with_leftover_noise}")
 
             batch_inds = latent_for_sample.get("batch_index", None)
-            noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds)
+            if (advanced_sampling and not add_noise) or noise_strength == 0.0:
+                noise = torch.zeros_like(latent_image)
+            else:
+                noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds)
+                if noise_strength != 1.0:
+                    noise = noise * noise_strength
             noise_mask = latent_for_sample.get("noise_mask", None)
             sampler = comfy.samplers.sampler_object(采样算法)
             x0_output = {}
             callback = latent_preview.prepare_callback(
                 model, max(int(sigmas.shape[-1]) - 1, 0), x0_output
             )
-            sampled_tensor = comfy.sample.sample_custom(
-                model, noise, CFG, sampler, sigmas, positive, negative, latent_image,
-                noise_mask=noise_mask, callback=callback,
-                disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=seed,
-            )
+            if len(sigmas) <= 1:
+                sampled_tensor = latent_image
+            else:
+                sampled_tensor = comfy.sample.sample_custom(
+                    model, noise, CFG, sampler, sigmas, positive, negative, latent_image,
+                    noise_mask=noise_mask, callback=callback,
+                    disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=seed,
+                )
 
             sampled_latent = latent_for_sample.copy()
             sampled_latent.pop("downscale_ratio_spacial", None)
@@ -976,7 +1275,8 @@ class BinyuanUltimateSamplerEN:
 
             samples = (sampled_latent,)
             
-            images = vae.decode(samples[0]["samples"])
+            preview_latent = denoised_latent if advanced_sampling and return_with_leftover_noise else sampled_latent
+            images = vae.decode(preview_latent["samples"])
             # 视频 VAE（如 Wan/Qwen/Krea2 用的 Wan21 VAE，latent_dim=3）解码后是 5D [B,T,H,W,C]，
             # 需要把时间维合并进 batch，得到标准 4D IMAGE [B,H,W,C]，否则 SaveImage 会报
             # "Cannot handle this data type"。与 ComfyUI 官方 VAEDecode 处理一致。
@@ -999,8 +1299,8 @@ class BinyuanUltimateSamplerEN:
                 self.cleanup_vram()
             # 不返回伪造图像和 None 输出；让错误停在本节点，避免下游节点
             # 报出 "NoneType has no attribute copy" 等误导性异常。
-            raise RuntimeError(f"Binyuan Sampler V6.5 EN failed / 执行失败: {e}") from e
+            raise RuntimeError(f"Binyuan Sampler V2.2 EN failed / 执行失败: {e}") from e
 
 NODE_CLASS_MAPPINGS = {"BinyuanUltimateSamplerEN": BinyuanUltimateSamplerEN}
-NODE_DISPLAY_NAME_MAPPINGS = {"BinyuanUltimateSamplerEN": "🛡️ Binyuan Sampler V6.5 EN｜中英双语版"}
+NODE_DISPLAY_NAME_MAPPINGS = {"BinyuanUltimateSamplerEN": "🛡️ Binyuan Sampler V2.2 EN｜中英双语版"}
 WEB_DIRECTORY = "js"

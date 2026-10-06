@@ -1,7 +1,7 @@
 {
   "BinyuanUltimateSamplerEN": {
-    "display_name": "🛡️ Binyuan Sampler V6.5 EN｜中英双语版",
-    "description": "All-in-one bilingual sampler: loads a whole checkpoint or a split stack (diffusion model + dual CLIP + VAE), encodes prompts, samples and decodes - and also outputs model/CLIP/VAE/latent/conditioning for chaining. Supports Flux / SD3 / Wan / Qwen-Image / Krea2 / Z-Image / LTXV / Hunyuan / Lumina2 ... English + Chinese UI.",
+    "display_name": "🛡️ Binyuan Sampler V2.2 EN｜中英双语版",
+    "description": "All-in-one bilingual sampler: loads a whole checkpoint or a split stack (diffusion model + dual CLIP + VAE), encodes prompts, samples and decodes - and also outputs model/CLIP/VAE/latent/conditioning for chaining. Supports Flux / SD3 / Wan / Qwen-Image / Qwen-Image-2.1 / Krea2 / Z-Image / LTXV / Hunyuan / Lumina2 ... English + Chinese UI.",
     "inputs": {
       "load_mode": {
         "name": "Load Mode",
@@ -31,12 +31,12 @@
       "clip_type": {
         "name": "CLIP Type",
         "display_name": "CLIP Type",
-        "tooltip": "Must match the architecture of the model above."
+        "tooltip": "For Qwen-Image-2.1 select qwen_image_2.1 (alias of qwen_image). Use the matching Qwen3-VL 8B image encoder."
       },
       "vae": {
         "name": "VAE",
         "display_name": "VAE",
-        "tooltip": "baked_vae = use the VAE inside the checkpoint; separate models need an external VAE."
+        "tooltip": "Split models require their matching VAE. Qwen-Image-2.1 needs its 64-channel RGBA VAE, not the older Wan VAE."
       },
       "weight_precision": {
         "name": "Weight Precision",
@@ -56,7 +56,7 @@
       "latent_source": {
         "name": "Latent Source",
         "display_name": "Latent Source",
-        "tooltip": "Empty latent / external latent / upstream image / stitch several images."
+        "tooltip": "Qwen-Image-2.1 uses upstream images as references and starts from an empty latent matching the first reference. External latent priority and stitching remain available."
       },
       "positive_prompt": {
         "name": "Positive Prompt",
@@ -94,8 +94,8 @@
         "tooltip": "Random seed."
       },
       "steps": {
-        "name": "Steps",
-        "display_name": "Steps",
+        "name": "Total steps",
+        "display_name": "Total steps",
         "tooltip": "Sampling steps."
       },
       "cfg": {
@@ -121,7 +121,7 @@
       "denoise": {
         "name": "Denoise",
         "display_name": "Denoise",
-        "tooltip": "1.0 = txt2img, lower = img2img."
+        "tooltip": "For Qwen-Image-2.1 reference editing, use 1.0. Reduce it when intentionally resampling an external latent."
       },
       "lora_json": {
         "name": "LoRA JSON",
@@ -181,17 +181,56 @@
       "upstream_image_1": {
         "name": "Upstream Image 1",
         "display_name": "Upstream Image 1",
-        "tooltip": "IMAGE input."
+        "tooltip": "Qwen-Image-2.1 reference image: sent to both the vision encoder and VAE; RGBA is preserved. One image per input."
       },
       "upstream_image_2": {
         "name": "Upstream Image 2",
         "display_name": "Upstream Image 2",
-        "tooltip": "IMAGE input."
+        "tooltip": "Qwen-Image-2.1 reference image: sent to both the vision encoder and VAE; RGBA is preserved. One image per input."
       },
       "upstream_image_3": {
         "name": "Upstream Image 3",
         "display_name": "Upstream Image 3",
-        "tooltip": "IMAGE input."
+        "tooltip": "Qwen-Image-2.1 reference image: sent to both the vision encoder and VAE; RGBA is preserved. One image per input."
+      },
+      "qwen_reference_resolution": {
+        "name": "Qwen reference resolution",
+        "display_name": "Qwen reference resolution",
+        "tooltip": "Qwen-Image-2.1 only: reference pixel budget is resolution squared; 0 preserves original size, aligned to 32. Output follows the first reference."
+      },
+      "qwen_edit_mode": {
+        "name": "Qwen Edit Mode",
+        "display_name": "Qwen Edit Mode",
+        "tooltip": "Auto preserves existing workflows. Native reference edit uses official reference conditioning and an empty latent. VAE redraw uses the reference latent as the starting canvas and enables Denoise."
+      },
+      "attention_backend": {
+        "name": "Attention Backend",
+        "display_name": "Attention Backend",
+        "tooltip": "Auto safe selects Comfy Kitchen for internally loaded Krea2/Qwen-Image-2.1 models when available, otherwise sub-quadratic attention. Externally patched models and other families keep their own backend. Core default follows ComfyUI startup flags."
+      },
+      "advanced_sampling": {
+        "name": "Advanced sampling",
+        "display_name": "Advanced sampling"
+      },
+      "start_at_step": {
+        "name": "Start at step",
+        "display_name": "Start at step"
+      },
+      "end_at_step": {
+        "name": "End at step",
+        "display_name": "End at step"
+      },
+      "add_noise": {
+        "name": "Add noise",
+        "display_name": "Add noise"
+      },
+      "return_with_leftover_noise": {
+        "name": "Return with leftover noise",
+        "display_name": "Return with leftover noise"
+      },
+      "noise_strength": {
+        "name": "Initial noise strength",
+        "display_name": "Initial noise strength"
       }
     },
     "outputs": {

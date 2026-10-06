@@ -1,7 +1,7 @@
 {
   "BinyuanUltimateSamplerEN": {
-    "display_name": "🛡️ Binyuan Sampler V6.5 EN｜中英双语版",
-    "description": "一体化中英双语采样器：整包 Checkpoint 或分离式（扩散模型+CLIP+VAE）加载、条件编码、采样、解码出图，并把模型/CLIP/VAE/Latent/条件作为端口输出方便串联。支持 Flux / SD3 / Wan / Qwen-Image / Krea2 / Z-Image / LTXV / Hunyuan / Lumina2 等架构。",
+    "display_name": "🛡️ Binyuan Sampler V2.2 EN｜中英双语版",
+    "description": "一体化中英双语采样器：整包 Checkpoint 或分离式（扩散模型+CLIP+VAE）加载、条件编码、采样、解码出图，并把模型/CLIP/VAE/Latent/条件作为端口输出方便串联。支持 Flux / SD3 / Wan / Qwen-Image / Qwen-Image-2.1 / Krea2 / Z-Image / LTXV / Hunyuan / Lumina2 等架构。",
     "inputs": {
       "load_mode": {
         "name": "加载模式",
@@ -31,12 +31,12 @@
       "clip_type": {
         "name": "CLIP 类型",
         "display_name": "CLIP 类型",
-        "tooltip": "必须与上面模型的架构一致。"
+        "tooltip": "Qwen-Image-2.1 选择 qwen_image_2.1（映射为 qwen_image），搭配对应的 Qwen3-VL 8B 图像条件编码器。"
       },
       "vae": {
         "name": "VAE",
         "display_name": "VAE",
-        "tooltip": "baked_vae = 用模型内置 VAE；分离式模型必须外挂 VAE。"
+        "tooltip": "分离式模型需要匹配的 VAE。Qwen-Image-2.1 使用专用64通道 RGBA VAE，不是旧版 Wan VAE。"
       },
       "weight_precision": {
         "name": "权重精度",
@@ -56,7 +56,7 @@
       "latent_source": {
         "name": "Latent 输入源",
         "display_name": "Latent 输入源",
-        "tooltip": "空 Latent / 外部 Latent / 上游图像 / 多图横向拼接。"
+        "tooltip": "Qwen-Image-2.1 将上游图像用作参考条件，从匹配第一张参考图尺寸的空 Latent 开始；仍可优先使用外部 Latent 或拼接参考图。"
       },
       "positive_prompt": {
         "name": "正面提示词",
@@ -94,8 +94,8 @@
         "tooltip": "随机种子。"
       },
       "steps": {
-        "name": "步数",
-        "display_name": "步数",
+        "name": "总步数",
+        "display_name": "总步数",
         "tooltip": "采样步数。"
       },
       "cfg": {
@@ -121,7 +121,7 @@
       "denoise": {
         "name": "重绘强度",
         "display_name": "重绘强度",
-        "tooltip": "1.0 = 文生图，越低越偏图生图。"
+        "tooltip": "Qwen-Image-2.1 参考图编辑使用1.0；有意重绘外部 Latent 时再降低。"
       },
       "lora_json": {
         "name": "LoRA JSON",
@@ -181,17 +181,56 @@
       "upstream_image_1": {
         "name": "上游图像 1",
         "display_name": "上游图像 1",
-        "tooltip": "IMAGE 输入。"
+        "tooltip": "Qwen-Image-2.1 参考图：同时送入视觉编码器和 VAE，保留 RGBA；每个端口取一张。"
       },
       "upstream_image_2": {
         "name": "上游图像 2",
         "display_name": "上游图像 2",
-        "tooltip": "IMAGE 输入。"
+        "tooltip": "Qwen-Image-2.1 参考图：同时送入视觉编码器和 VAE，保留 RGBA；每个端口取一张。"
       },
       "upstream_image_3": {
         "name": "上游图像 3",
         "display_name": "上游图像 3",
-        "tooltip": "IMAGE 输入。"
+        "tooltip": "Qwen-Image-2.1 参考图：同时送入视觉编码器和 VAE，保留 RGBA；每个端口取一张。"
+      },
+      "qwen_reference_resolution": {
+        "name": "Qwen 参考分辨率",
+        "display_name": "Qwen 参考分辨率",
+        "tooltip": "仅用于 Qwen-Image-2.1：参考图像素预算为分辨率平方，0 保持原尺寸并对齐32；编辑输出跟随第一张参考图。"
+      },
+      "qwen_edit_mode": {
+        "name": "Qwen 编辑模式",
+        "display_name": "Qwen 编辑模式",
+        "tooltip": "自动模式兼容旧工作流；原生参考编辑使用官方参考条件与空 Latent；VAE传统重绘把参考 Latent 作为起始画布并启用重绘强度。"
+      },
+      "attention_backend": {
+        "name": "注意力后端",
+        "display_name": "注意力后端",
+        "tooltip": "自动稳定为内部加载的Krea2/Qwen-Image-2.1模型优先使用Comfy Kitchen，否则使用分块注意力；外接已修补模型和其他架构保持原后端。内核默认遵循ComfyUI启动参数。"
+      },
+      "advanced_sampling": {
+        "name": "高级分段采样",
+        "display_name": "高级分段采样"
+      },
+      "start_at_step": {
+        "name": "起始步数",
+        "display_name": "起始步数"
+      },
+      "end_at_step": {
+        "name": "结束步数",
+        "display_name": "结束步数"
+      },
+      "add_noise": {
+        "name": "添加噪声",
+        "display_name": "添加噪声"
+      },
+      "return_with_leftover_noise": {
+        "name": "保留剩余噪声",
+        "display_name": "保留剩余噪声"
+      },
+      "noise_strength": {
+        "name": "初始噪声强度",
+        "display_name": "初始噪声强度"
       }
     },
     "outputs": {
