@@ -24,17 +24,10 @@ jobs:
       - name: Install comfy-cli
         run: pip install comfy-cli
 
-      - name: Show repository layout
-        run: ls -la custom_nodes/binyuan_sampler_plugin_english
-
-      # Comfy-Org/publish-node-action runs `comfy node publish` at the repo root,
-      # which has no pyproject.toml here, so it is not used.
-      # The cd happens inside the script: a step-level `working-directory` is
-      # resolved before checkout and fails on a fresh runner.
+      # pyproject.toml lives at the repository root, so publishing runs there.
+      # (Locally the files sit in custom_nodes/binyuan_sampler_plugin_english,
+      #  but the GitHub repository itself is flat.)
       - name: Publish Custom Node
         env:
           REGISTRY_ACCESS_TOKEN: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
-        run: |
-          set -euo pipefail
-          cd custom_nodes/binyuan_sampler_plugin_english
-          comfy --skip-prompt --no-enable-telemetry node publish --token "$REGISTRY_ACCESS_TOKEN"
+        run: comfy --skip-prompt --no-enable-telemetry node publish --token "$REGISTRY_ACCESS_TOKEN"
