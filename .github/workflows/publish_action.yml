@@ -1,0 +1,35 @@
+name: Publish to Comfy registry
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "pyproject.toml"
+
+jobs:
+  publish-node:
+    name: Publish Custom Node to registry
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install comfy-cli
+        run: pip install comfy-cli
+
+      # The plugin lives in a subfolder, so publish from inside it.
+      # Comfy-Org/publish-node-action always runs `comfy node publish` at the
+      # repo root, where this repo has no pyproject.toml, so it is not used here.
+      - name: Publish Custom Node
+        shell: bash
+        working-directory: custom_nodes/binyuan_sampler_plugin_english
+        env:
+          REGISTRY_ACCESS_TOKEN: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
+        run: comfy --skip-prompt --no-enable-telemetry node publish --token "$REGISTRY_ACCESS_TOKEN"
