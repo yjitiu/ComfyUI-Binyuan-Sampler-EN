@@ -1,4 +1,4 @@
-# 🛡️ Binyuan Sampler V2.2 EN - bilingual (English / 中文) build
+# 🛡️ Binyuan Sampler V2.3 EN - bilingual (English / 中文) build
 # Includes native Qwen-Image-2.1 conditioning and reference-image support.
 # This node uses its own key (BinyuanUltimateSamplerEN) so it can live next to the Chinese version.
 import os
@@ -13,6 +13,10 @@ import importlib.util
 import torch
 import folder_paths
 import nodes
+import node_helpers
+import comfy.model_base
+from comfy_extras.nodes_model_advanced import ModelSamplingSD3
+from comfy_extras.nodes_slg import SkipLayerGuidanceDiTSimple
 import comfy.utils
 import comfy.sd
 import comfy.sample
@@ -48,10 +52,10 @@ def get_files_cached(folder):
 # 其文本编码器与 PixelDiT 家族同源，因此归一化到 pixeldit，保证可正常加载。
 CLIP_TYPE_CANONICAL = {
     "ace": "ace", "boogu": "boogu", "chroma": "chroma", "cogvideox": "cogvideox",
-    "cosmos": "cosmos", "flux": "flux", "flux2": "flux2", "hidream": "hidream",
+    "cosmos": "cosmos", "flux": "flux", "flux2": "flux2", "flux3": "flux3", "hidream": "hidream",
     "hunyuan_image": "hunyuan_image", "ideogram4": "ideogram4", "krea2": "krea2",
     "lens": "lens", "longcat_image": "longcat_image", "ltxv": "ltxv",
-    "lumina2": "lumina2", "mochi": "mochi", "omnigen2": "omnigen2", "ovis": "ovis",
+    "lumina2": "lumina2", "mochi": "mochi", "moss_image": "moss_image", "omnigen2": "omnigen2", "ovis": "ovis",
     "pid": "pixeldit", "pixart": "pixart", "pixeldit": "pixeldit", "pixl": "pixeldit",
     "qwen_image": "qwen_image", "qwen_image_2.1": "qwen_image", "sd3": "sd3", "stable_audio": "stable_audio",
     "stable_cascade": "stable_cascade", "stable_diffusion": "stable_diffusion", "wan": "wan",
@@ -72,8 +76,13 @@ def binyuan_expand_dynamic_prompt(text, seed=0, label="正面"):
     - 选项之间只能用半角竖线 |，支持嵌套
     - 每次运行重新随机（与网页端抽签一致），不看 seed
     """
-    if not isinstance(text, str) or "{" not in text:
+    if not isinstance(text, str) or "{" not in text or "|" not in text:
         return text
+    try:
+        if isinstance(json.loads(text), (dict, list)):
+            return text
+    except (ValueError, TypeError):
+        pass
     if text.count("{") != text.count("}"):
         print("[binyuan] %s提示词花括号不配对（{ %d 个 / } %d 个），已跳过抽签，原文送进模型。"
               % (label, text.count("{"), text.count("}")))
@@ -123,7 +132,7 @@ def binyuan_expand_dynamic_prompt(text, seed=0, label="正面"):
                     continue
                 cur += a
             opts.append(cur)
-            out += walk(opts[rng.randrange(len(opts))])
+            out += walk(opts[rng.randrange(len(opts))]) if len(opts) > 1 else "{" + walk(cur) + "}"
         return out
 
     result = re.sub(r"\\([{}|])", r"\1", walk(s))
@@ -139,6 +148,26 @@ def normalize_clip_type(clip_type):
         return "stable_diffusion"
     key = clip_type.lower()
     return CLIP_TYPE_CANONICAL.get(key, "stable_diffusion")
+
+def _get_moss_module(name):
+    """Reuse the installed official plugin without changing ComfyUI core."""
+    root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "moss-image")
+    package = "binyuan_moss_image"
+    if not os.path.isfile(os.path.join(root, "__init__.py")):
+        raise RuntimeError("Install the official MOSS-Image plugin at custom_nodes/moss-image / 请安装官方MOSS-Image插件")
+    if package not in sys.modules:
+        spec = importlib.util.spec_from_file_location(package, os.path.join(root, "__init__.py"), submodule_search_locations=[root])
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[package] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            for key in list(sys.modules):
+                if key == package or key.startswith(package + "."):
+                    del sys.modules[key]
+            raise
+    return importlib.import_module("." + name, package)
+
 
 # ========== GGUF 支持 ==========
 # 复用 ComfyUI-GGUF（City96）的加载器，让本节点可直接选择 .gguf 扩散模型 / CLIP。
@@ -412,9 +441,9 @@ class BinyuanUltimateSamplerEN:
 
         # every type supported by this plugin (aligned with ComfyUI CLIPType)
         CLIP_TYPES = [
-            "ACE", "boogu", "chroma", "cogvideox", "cosmos", "flux", "flux2",
+            "ACE", "boogu", "chroma", "cogvideox", "cosmos", "flux", "flux2", "flux3",
             "hidream", "hunyuan_image", "ideogram4", "krea2", "lens", "longcat_image",
-            "LTXV", "lumina2", "mochi", "omnigen2", "ovis", "pid", "PixArt",
+            "LTXV", "lumina2", "mochi", "moss_image", "omnigen2", "ovis", "pid", "PixArt",
             "pixeldit", "pixl", "qwen_image", "qwen_image_2.1", "sd3", "SD3", "stable_audio",
             "stable_cascade", "stable_diffusion", "wan"
         ]
@@ -456,6 +485,7 @@ class BinyuanUltimateSamplerEN:
                 "lora_list": (["None"] + get_files("loras") + get_files("lora"),),
                 "cleanup_vram": ("BOOLEAN", {"default": False, "label": "Clear VRAM after run / 生成后清理显存"}),
             },
+            "hidden": {"unique_id": "UNIQUE_ID"},
             "optional": ReferenceImageInputs({
                 "external_model": ("MODEL",),
                 "external_clip": ("CLIP",),
@@ -468,6 +498,14 @@ class BinyuanUltimateSamplerEN:
                 "upstream_image_1": ("IMAGE",),
                 "upstream_image_2": ("IMAGE",),
                 "upstream_image_3": ("IMAGE",),
+                "moss_model_path": ("STRING", {"default": "", "tooltip": "Local MOSS HF/Diffusers directory; select clip_type=moss_image. Empty uses separate model/clip/VAE dropdowns. / 本地完整模型目录，留空使用分离权重。"}),
+                "moss_text_device": (["default", "cpu"], {"default": "default"}),
+                "moss_shift": ("FLOAT", {"default": 5.0, "min": 0.01, "max": 100.0, "step": 0.1}),
+                "moss_uncond_skip_layers": ("STRING", {"default": "22", "tooltip": "MOSS negative-branch layer skipping; empty disables. / 负分支跳层，留空关闭。"}),
+                "flux3_edit_mode": (["Auto", "Native reference edit", "VAE redraw"], {
+                    "default": "Auto",
+                    "tooltip": "FLUX 3 Auto/Native: upstream images become references, with an empty output canvas. VAE redraw: initial image latent and adjustable denoise. / 自动或原生编辑使用参考条件与空画布；VAE重绘使用初始图像Latent，可调重绘强度。"
+                }),
                 "qwen_reference_resolution": ("INT", {"default": 1024, "min": 0, "max": 4096, "step": 32,
                     "tooltip": "Qwen-Image-2.1 reference pixel budget (resolution squared); 0 keeps original size, aligned to 32. Editing output follows the first reference. / Qwen-Image-2.1 参考图像素预算（分辨率平方）；0 保持原尺寸并对齐32，编辑输出尺寸跟随第一张参考图。"}),
                 "qwen_edit_mode": (["Auto ｜ 自动", "Native reference edit ｜ 原生参考编辑", "VAE redraw ｜ VAE传统重绘"], {
@@ -655,11 +693,22 @@ class BinyuanUltimateSamplerEN:
             return vae_obj.__class__.__name__
         return "未知VAE"
 
-    def load_clip_internal(self, clip_1, clip_2, clip_type_canon):
+    def load_clip_internal(self, clip_1, clip_2, clip_type_canon, text_device="default"):
         """加载 CLIP，自动按文件后缀在标准加载器与 GGUF 加载器间分流。
         任一 CLIP 文件为 .gguf 即整体走 GGUF 加载器（混用 scaled_fp8 与 gguf 不被支持）。"""
         if not clip_1 or clip_1 == "None":
             return None
+        if clip_type_canon == "moss_image":
+            if clip_2 and clip_2 != "None":
+                raise ValueError("MOSS-Image uses one Qwen3.5-9B encoder; set clip_2=None / clip_2请留空")
+            if clip_1.lower().endswith(".gguf"):
+                raise ValueError("MOSS-Image GGUF text encoding is not supported by the official loader")
+            path = (folder_paths.get_full_path("text_encoders", clip_1) or folder_paths.get_full_path("clip", clip_1))
+            if not path:
+                raise FileNotFoundError(f"MOSS text encoder not found: {clip_1}")
+            if hasattr(comfy.sd.CLIPType, "MOSS_IMAGE"):
+                return nodes.CLIPLoader().load_clip(clip_1, "moss_image", device=text_device)[0]
+            return _get_moss_module("loaders").load_clip(path, text_device)
         use_gguf = clip_1.lower().endswith(".gguf") or (
             clip_2 and clip_2 != "None" and clip_2.lower().endswith(".gguf")
         )
@@ -758,6 +807,7 @@ class BinyuanUltimateSamplerEN:
         comfy.sd.load_lora_for_models），不触碰易变的内部接口，保证跨内核可用。
         """
         loaded_count = 0
+        report = []
         for idx, lora in enumerate(lora_list):
             if not isinstance(lora, dict):
                 continue
@@ -774,6 +824,8 @@ class BinyuanUltimateSamplerEN:
             sm = float(sm) if sm is not None else strength
             sc = float(sc) if sc is not None else strength
 
+            item = {"name": lora_name, "model_weight": sm, "clip_weight": sc, "status": "missing"}
+            report.append(item)
             # 查找文件（同时兼容 loras / lora 两个目录名）
             lora_path = folder_paths.get_full_path("loras", lora_name)
             if not lora_path:
@@ -787,14 +839,16 @@ class BinyuanUltimateSamplerEN:
                 lora_sd = comfy.utils.load_torch_file(lora_path, safe_load=True)
                 model, clip = comfy.sd.load_lora_for_models(model, clip, lora_sd, sm, sc)
                 loaded_count += 1
+                item["status"] = "loaded"
                 print(f"[INFO] LoRA loaded: {lora_name}")
             except Exception as e:
+                item["status"] = "failed"
                 print(f"[WARN] LoRA load failed {lora_name}: {e}")
 
-        return model, clip, loaded_count
+        return model, clip, loaded_count, report
 
     def run(self, **kwargs):
-        print("[INFO] Binyuan Sampler V2.2 EN (bilingual)")
+        print("[INFO] Binyuan Sampler V2.3 EN (bilingual)")
         # ---- English UI -> internal canonical keys/values ----
         kwargs = self._translate_kwargs(kwargs)
         
@@ -907,17 +961,31 @@ class BinyuanUltimateSamplerEN:
                 
                 if clip is None and CLIP_1 and CLIP_1 != "None":
                     print(f"[INFO] 外接缺少CLIP，从内部补充: {CLIP_1} (类型: {CLIP_类型} → {CLIP_类型_规范})")
-                    clip = self.load_clip_internal(CLIP_1, CLIP_2, CLIP_类型_规范)
+                    clip = self.load_clip_internal(CLIP_1, CLIP_2, CLIP_类型_规范, kwargs.get("moss_text_device", "default"))
                 
                 if vae is None and VAE and VAE != "baked_vae" and VAE != "None":
                     print(f"[INFO] 外接缺少VAE，从内部补充: {VAE}")
                     vae_path = folder_paths.get_full_path("vae", VAE)
                     if vae_path:
-                        vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(vae_path))
+                        vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(vae_path), **({"dtype": torch.float32} if CLIP_类型_规范 == "moss_image" else {}))
             
             else:
                 print("[INFO] 串联模式=使用自身模型，使用内部配置")
-                if 加载模式 == "整包Checkpoint":
+                if CLIP_类型_规范 == "moss_image" and kwargs.get("moss_model_path", "").strip():
+                    moss = _get_moss_module("hf")
+                    dtype = 权重精度
+                    if dtype not in _get_moss_module("loaders").DTYPES:
+                        raise ValueError(f"MOSS weight precision unsupported: {dtype}")
+                    root = kwargs["moss_model_path"].strip()
+                    if hasattr(comfy.model_base, "MOSSImage"):
+                        transformer_path, _ = moss.component(root, "transformer")
+                        state = moss.read_weights(transformer_path, "diffusion_pytorch_model")
+                        model = comfy.sd.load_diffusion_model_state_dict(state, model_options=model_options)
+                    else:
+                        model = moss.load_hf_model(root, dtype)
+                    clip = moss.load_hf_clip(root, kwargs.get("moss_text_device", "default"))
+                    vae = moss.load_hf_vae(root)
+                elif 加载模式 == "整包Checkpoint":
                     if not Checkpoint or Checkpoint == "None":
                         raise ValueError("Please select a Checkpoint / 请选择 Checkpoint")
                     checkpoint_path = folder_paths.get_full_path("checkpoints", Checkpoint)
@@ -941,7 +1009,19 @@ class BinyuanUltimateSamplerEN:
                                         folder_paths.get_full_path("unet", 扩散模型) or
                                         folder_paths.get_full_path("unet_gguf", 扩散模型))
                         if diffusion_path:
-                            if 扩散模型.lower().endswith(".gguf"):
+                            if CLIP_类型_规范 == "moss_image":
+                                moss = _get_moss_module("loaders")
+                                if 扩散模型.lower().endswith(".gguf") or 权重精度 not in moss.DTYPES:
+                                    raise ValueError("MOSS official loader requires safetensors and a supported precision / 请使用官方支持的权重格式与精度")
+                                if hasattr(comfy.model_base, "MOSSImage"):
+                                    model = comfy.sd.load_diffusion_model(diffusion_path, model_options=model_options)
+                                else:
+                                    state, metadata = comfy.utils.load_torch_file(diffusion_path, return_metadata=True)
+                                    if any(re.fullmatch(r"(?:.*\.)?layers\.\d+\.proj\.qkv\.weight", key) for key in state):
+                                        raise RuntimeError("This MOSS checkpoint uses fused QKV. Update ComfyUI for native MOSS-Image support. / 此权重为合并QKV格式，请更新ComfyUI内核，旧插件不能正确加载。")
+                                    model = moss.load_model_state(state, moss.DTYPES[权重精度], False, metadata=metadata,
+                                                                  fp8_optimizations=权重精度 == "fp8_e4m3fn_fast")
+                            elif 扩散模型.lower().endswith(".gguf"):
                                 print(f"[INFO] 加载GGUF扩散模型: {扩散模型}")
                                 model = load_gguf_diffusion_model(diffusion_path)
                             else:
@@ -957,7 +1037,7 @@ class BinyuanUltimateSamplerEN:
                         raise ValueError("Separate mode requires a diffusion model / 分离模式下必须选择扩散模型")
                     
                     if CLIP_1 and CLIP_1 != "None":
-                        clip = self.load_clip_internal(CLIP_1, CLIP_2, CLIP_类型_规范)
+                        clip = self.load_clip_internal(CLIP_1, CLIP_2, CLIP_类型_规范, kwargs.get("moss_text_device", "default"))
                         if clip is None:
                             raise RuntimeError("CLIP load failed / CLIP 加载失败")
                     else:
@@ -966,7 +1046,7 @@ class BinyuanUltimateSamplerEN:
                     if VAE and VAE != "baked_vae" and VAE != "None":
                         vae_path = folder_paths.get_full_path("vae", VAE)
                         if vae_path:
-                            vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(vae_path))
+                            vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(vae_path), **({"dtype": torch.float32} if CLIP_类型_规范 == "moss_image" else {}))
                             print(f"[INFO] loaded VAE: {VAE}")
             
             if model is None:
@@ -1003,20 +1083,36 @@ class BinyuanUltimateSamplerEN:
                 model, 注意力后端, internally_loaded=not (use_inherit and external_model is not None)
             )
             is_qwen21 = isinstance(self.get_latent_format(model), getattr(comfy.latent_formats, "QwenImage21", ()))
+            is_moss = type(model.model).__name__ == "MOSSImage"
+            if is_moss and not (use_inherit and external_model is not None):
+                model = ModelSamplingSD3().patch(
+                    model, float(kwargs.get("moss_shift", 5.0)),
+                    multiplier=model.get_model_object("model_sampling").multiplier,
+                )[0]
+                skip_layers = kwargs.get("moss_uncond_skip_layers", "22").strip()
+                if skip_layers:
+                    model = SkipLayerGuidanceDiTSimple.execute(model, 0.0, 1.0, single_layers=skip_layers)[0]
+            is_flux3 = isinstance(model.model, getattr(comfy.model_base, "Flux3", ()))
+            flux3_native_edit = is_flux3 and kwargs.get("flux3_edit_mode", "Auto") != "VAE redraw"
+
             
             # ========== LoRA 加载（多 LoRA 叠加，跨内核稳定） ==========
+            lora_report = []
             lora_list = self.parse_lora_config(lora_json_str)
             if isinstance(lora_settings, list):
                 lora_list.extend(lora_settings)
             if lora_list:
                 print(f"[INFO] {len(lora_list)} LoRA(s) configured")
-                model, clip, loaded_count = self.load_loras(model, clip, lora_list)
+                model, clip, loaded_count, lora_report = self.load_loras(model, clip, lora_list)
                 print(f"[INFO] {loaded_count} LoRA(s) loaded")
             else:
                 print("[INFO] no LoRA configured")
             
             # ========== 条件编码 ==========
             def encode_prompt(text, clip_type_val, guidance_val):
+                if is_moss:
+                    return clip.encode_from_tokens_scheduled(clip.tokenize(text))
+
                 if not text or not text.strip():
                     text = " "
                 tokens = clip.tokenize(text)
@@ -1087,8 +1183,21 @@ class BinyuanUltimateSamplerEN:
                 negative = encode_prompt(负面提示词, CLIP_类型_规范, Flux引导)
             else:
                 # 空负面也要走 return_dict，保证 attention_mask/num_tokens 与正面一致
-                negative = encode_prompt(" ", CLIP_类型_规范, Flux引导)
+                negative = encode_prompt("" if is_moss else " ", CLIP_类型_规范, Flux引导)
             
+            flux3_references = []
+            if flux3_native_edit and upstream_images:
+                references = upstream_images
+                if Latent输入源 == "上游图像拼接":
+                    _, target_h = self.get_image_size(references[0])
+                    references = [self.stitch_images_horizontal(references, target_h)]
+                for image in references:
+                    for frame in image.split(1):
+                        flux3_references.append(nodes.VAEEncode().encode(vae, frame)[0]["samples"])
+                # Same append semantics as the core ReferenceLatent node.
+                positive = node_helpers.conditioning_set_values(positive, {"reference_latents": flux3_references}, append=True)
+                negative = node_helpers.conditioning_set_values(negative, {"reference_latents": flux3_references}, append=True)
+
             # ========== Latent ========== 
             latent = None
             latent_origin = "unknown"
@@ -1100,6 +1209,10 @@ class BinyuanUltimateSamplerEN:
                 latent = external_latent
                 latent_origin = "external"
                 print("[INFO] using external latent (preferred)")
+            elif flux3_native_edit and (flux3_references or any(c[1].get("reference_latents") for c in positive)):
+                latent = self.empty_latent_for_model(model, 宽度, 高度, 生成数量)
+                latent_origin = "empty"
+                print("[INFO] FLUX 3 native reference edit: empty output canvas; denoise=1")
             elif is_qwen21 and qwen_runtime_mode == "VAE传统重绘" and upstream_images:
                 # TextEncodeQwenImage21 already VAE-encodes the references. Reuse the
                 # first official reference latent as the noisy starting image instead
@@ -1196,6 +1309,7 @@ class BinyuanUltimateSamplerEN:
             )
             latent_for_sample["samples"] = latent_image
 
+            effective_denoise = None
             if external_sigmas is not None:
                 sigmas = external_sigmas
                 print(f"[INFO] 使用外部Sigmas，采样步数: {max(int(sigmas.shape[-1]) - 1, 0)}")
@@ -1289,6 +1403,26 @@ class BinyuanUltimateSamplerEN:
             if 自动清理显存:
                 self.cleanup_vram()
             
+            # Small scalar metadata travels with this result, including cached results.
+            images._binyuan_generation_info = {
+                "node_id": str(kwargs.get("unique_id", "")),
+                "seed": seed, "steps": max(len(sigmas) - 1, 0), "cfg": CFG,
+                "sampler": 采样算法,
+                "scheduler": "external sigmas" if external_sigmas is not None else 调度器,
+                "denoise": effective_denoise,
+                "advanced": advanced_sampling,
+                "start": start_at_step if advanced_sampling else None,
+                "end": stop if advanced_sampling else None,
+                "noise_added": not ((advanced_sampling and not add_noise) or noise_strength == 0.0),
+                "noise_strength": noise_strength,
+                "model_external": use_inherit and external_model is not None,
+                "clip_external": use_inherit and external_model is not None and external_clip is not None,
+                "vae_external": use_inherit and external_model is not None and external_vae is not None,
+                "positive_external": use_inherit and external_positive is not None,
+                "negative_external": use_inherit and external_negative is not None,
+                "latent_origin": latent_origin,
+                "loras": lora_report,
+            }
             return (images, model, clip, vae, samples[0], positive, negative, denoised_latent)
             
         except Exception as e:
@@ -1299,8 +1433,8 @@ class BinyuanUltimateSamplerEN:
                 self.cleanup_vram()
             # 不返回伪造图像和 None 输出；让错误停在本节点，避免下游节点
             # 报出 "NoneType has no attribute copy" 等误导性异常。
-            raise RuntimeError(f"Binyuan Sampler V2.2 EN failed / 执行失败: {e}") from e
+            raise RuntimeError(f"Binyuan Sampler V2.3 EN failed / 执行失败: {e}") from e
 
 NODE_CLASS_MAPPINGS = {"BinyuanUltimateSamplerEN": BinyuanUltimateSamplerEN}
-NODE_DISPLAY_NAME_MAPPINGS = {"BinyuanUltimateSamplerEN": "🛡️ Binyuan Sampler V2.2 EN｜中英双语版"}
+NODE_DISPLAY_NAME_MAPPINGS = {"BinyuanUltimateSamplerEN": "🛡️ Binyuan Sampler V2.3 EN｜中英双语版"}
 WEB_DIRECTORY = "js"

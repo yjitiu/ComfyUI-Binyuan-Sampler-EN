@@ -1,12 +1,35 @@
-> 2026-10-06 更新：新增高级分段采样和可调初始噪声强度。请先阅读 [完整使用说明（Markdown）](USAGE_V2.2_EN.md) 或 [TXT说明](USAGE_V2.2_EN.txt)。
+## V2.3 Base fused-QKV loading fix
+
+优先使用 ComfyUI 内核 MOSS-Image 加载器，支持 Base 合并 QKV 和 SFT 分离 Q/K/V 权重。旧独立插件无法加载合并 QKV，旧内核下会明确报错，避免缺失注意力权重仍继续出图。应用 Shift 时保留模型原有 timestep multiplier（原生内核为 1，旧独立插件为 1000）。原生文本编码器也优先使用内核加载路径。版本仍为 V2.3。
+
+## V2.3 — MOSS-Image support
+
+依赖已安装的官方 custom_nodes/moss-image 插件，不修改 ComfyUI 内核。
+- 分离权重：使用自身模型、Separate 模式、clip_type=moss_image；选择 MOSS Base/SFT 扩散权重、Qwen3.5-9B 文本编码器、FLUX.2 VAE，clip_2=None。
+- 本地完整目录：clip_type=moss_image，moss_model_path 填含 transformer、text_encoder、tokenizer、vae 的目录；该路径优先于内部加载下拉框。
+- 推荐手动设置 steps=50、cfg=3、sampler=euler、scheduler=sgm_uniform。内部加载自动应用 moss_shift=5 和 moss_uncond_skip_layers=22，留空跳层可关闭。Flux guidance 不用于 MOSS。
+- 外接官方加载器的 MODEL/CLIP/VAE 选择继承上游；先在上游应用 ModelSamplingSD3 Shift 5 和 Simple SLG 22。采样器保留外部模型已有修补，不重复添加。
+- 原始布局 JSON 完整保留，画布尺寸须与布局坐标对应。当前支持文生图、布局生成、传统 VAE 重绘；不声称支持原生参考图编辑。
+- 官方加载器支持 safetensors；本次未添加 MOSS GGUF 支持。模型不自动下载。
+- VAE 内部加载使用 FP32；步数/CFG/采样器沿用用户输入，不自动覆盖。
+
+Implementation reuses the official MOSS local loaders and ComfyUI sampling/SLG. Base and SFT share this path. Existing FLUX 3 behavior is retained.
+
+## V2.3 — FLUX 3 Image
+
+选择 clip_type=flux3、配套 Qwen3-VL-4B 文本编码器、扩散模型与 VAE，clip_2 留空。接入上游图像即可原生参考编辑，多图分别编码，输出画布由节点宽高决定；denoise 使用 1。flux3_edit_mode=VAE redraw 沿用原有 Latent 输入源和可调重绘强度，选择上游图像优先可重绘首图。外接 Latent/Sigmas 仍优先。支持布局 JSON 提示词，也可连接内核 FLUX 3 Image Layout Prompt。
+
+Local FLUX 3 generation/editing requires a core with CLIPType.FLUX3 and comfy.model_base.Flux3. Select flux3, the matching Qwen3-VL-4B encoder and VAE; leave clip_2=None. Auto/Native encodes upstream images as references with an empty output canvas and denoise=1. VAE redraw follows existing latent-source selection. External latent/sigmas retain priority. No BFL API calls.
+
+> 2026-10-06 更新：新增高级分段采样和可调初始噪声强度。请先阅读 [完整使用说明（Markdown）](USAGE_V2.3_EN.md) 或 [TXT说明](USAGE_V2.3_EN.txt)。
 >
 > 本机核对环境为 ComfyUI 0.37.0；新增功能完成接口与逻辑测试，不代表所有模型、整合包和内核版本通用。普通模式下重绘强度与初始噪声强度可同时使用；高级模式忽略重绘强度，只有“添加噪声”开启时初始噪声强度才生效。
 
-# 🛡️ ComfyUI Binyuan · Ultimate Sampler V2.2 **EN (Bilingual)**
+# 🛡️ ComfyUI Binyuan · Ultimate Sampler V2.3 **EN (Bilingual)**
 
 Bilingual build of the all-in-one sampler: **English UI for English users, Chinese UI for Chinese users.**
 
-* Node: `🛡️ Binyuan Sampler V2.2 EN｜中英双语版` — category `Binyuan`
+* Node: `🛡️ Binyuan Sampler V2.3 EN｜中英双语版` — category `Binyuan`
 * Node key: `BinyuanUltimateSamplerEN` (different from the Chinese edition, so **both can be installed side by side**)
 * Widget labels: English ASCII keys, translated by `locales/en|zh/nodeDefs.json`
 * Combo values are written bilingually, e.g. `Inherit upstream ｜ 继承上游模型`
@@ -28,7 +51,7 @@ These paths use ComfyUI public node/model APIs and contain no integration-pack-s
 ## Install
 1. Copy this folder into `ComfyUI/custom_nodes/binyuan_sampler_plugin_english/` (the folder name does not matter).
 2. Restart ComfyUI (or use ComfyUI Manager: search `Binyuan Sampler`).
-3. Add the node: right-click → `Binyuan` → `🛡️ Binyuan Sampler V2.2 EN｜中英双语版`.
+3. Add the node: right-click → `Binyuan` → `🛡️ Binyuan Sampler V2.3 EN｜中英双语版`.
 
 ## Use
 * `Load Mode` = `Checkpoint (whole file)` → pick a checkpoint, connect `IMAGE` to `SaveImage`.
